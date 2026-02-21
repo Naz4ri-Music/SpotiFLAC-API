@@ -13,11 +13,13 @@ REST API wrapper for [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC) focused 
 - Temporary tokenized download URLs (`GET /v1/download/{token}`).
 - In-memory token store with TTL-based cleanup.
 - CORS enabled (`*`) for frontend/API integrations.
+- Automatic `ffmpeg/ffprobe` bootstrap on first download request (enabled by default).
 
 ## Architecture
 
 - `POST /v1/download-url`
   - Validates input and provider order.
+  - Ensures `ffmpeg/ffprobe` are available (auto-install if missing and enabled).
   - Fetches Spotify metadata through SpotiFLAC backend.
   - Tries providers in order until one succeeds.
   - Stores file path + token + expiry in memory.
@@ -35,23 +37,43 @@ REST API wrapper for [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC) focused 
 
 ## Run
 
+Default local run:
+
 ```bash
 go run .
 ```
 
-Default address: `http://localhost:8080`
+Run on `127.0.0.1:9000`:
+
+```bash
+BIND_ADDR=127.0.0.1 PORT=9000 BASE_URL=http://127.0.0.1:9000 go run .
+```
 
 ## Configuration
 
+- `BIND_ADDR`: bind address for the HTTP server (default: `127.0.0.1`)
 - `PORT`: HTTP port (default: `8080`)
 - `DOWNLOAD_TTL`: token TTL as Go duration (default: `2h`, example: `30m`)
 - `BASE_URL`: optional public base URL used when building `download_url`
+- `FFMPEG_AUTO_INSTALL`: auto-install `ffmpeg/ffprobe` when missing (default: `true`)
+  - accepted true values: `1`, `true`, `yes`, `on`
+  - accepted false values: `0`, `false`, `no`, `off`
 
 Example:
 
 ```bash
-PORT=8081 DOWNLOAD_TTL=1h BASE_URL=https://api.example.com go run .
+BIND_ADDR=127.0.0.1 PORT=9000 DOWNLOAD_TTL=1h BASE_URL=http://127.0.0.1:9000 go run .
 ```
+
+## FFmpeg behavior
+
+SpotiFLAC backend uses `ffmpeg` and/or `ffprobe` in several download and metadata paths.
+
+In this API:
+
+- `ffmpeg/ffprobe` are checked before processing download requests.
+- If missing and `FFMPEG_AUTO_INSTALL=true`, the API downloads and installs them automatically.
+- If auto-install is disabled and binaries are missing, requests fail with a clear error.
 
 ## API
 
@@ -87,7 +109,7 @@ Success response:
   "spotify_id": "3n3Ppam7vgaVa1iaRUc9Lp",
   "service": "tidal",
   "filename": "Track - Artist.flac",
-  "download_url": "http://localhost:8080/v1/download/<token>",
+  "download_url": "http://127.0.0.1:9000/v1/download/<token>",
   "expires_at": "2026-02-21T12:00:00Z",
   "attempts": [
     {
@@ -127,7 +149,7 @@ Returns the audio file as an attachment if token is valid and not expired.
 ## Usage example
 
 ```bash
-curl -s -X POST http://localhost:8080/v1/download-url \
+curl -s -X POST http://127.0.0.1:9000/v1/download-url \
   -H 'Content-Type: application/json' \
   -d '{"spotify_url":"https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp"}'
 ```
@@ -135,7 +157,7 @@ curl -s -X POST http://localhost:8080/v1/download-url \
 Then open the returned `download_url` in a browser or fetch it with:
 
 ```bash
-curl -L -o track.flac "http://localhost:8080/v1/download/<token>"
+curl -L -o track.flac "http://127.0.0.1:9000/v1/download/<token>"
 ```
 
 ## Dependency management (SpotiFLAC upstream)

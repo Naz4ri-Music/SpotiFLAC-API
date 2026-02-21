@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -175,15 +176,24 @@ func (s *downloadStore) startCleanupLoop(ctx context.Context, interval time.Dura
 }
 
 type apiServer struct {
-	store   *downloadStore
-	baseURL string
-	ttl     time.Duration
+	store             *downloadStore
+	baseURL           string
+	bindAddr          string
+	ttl               time.Duration
+	ffmpegAutoInstall bool
+	ffmpegMu          sync.Mutex
+	ffmpegReady       bool
 }
 
 func main() {
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
 		port = "8080"
+	}
+
+	bindAddr := strings.TrimSpace(os.Getenv("BIND_ADDR"))
+	if bindAddr == "" {
+		bindAddr = "127.0.0.1"
 	}
 
 	ttl := 2 * time.Hour
@@ -198,10 +208,14 @@ func main() {
 		ttl = parsed
 	}
 
+	ffmpegAutoInstall := envBoolDefaultTrue("FFMPEG_AUTO_INSTALL")
+
 	server := &apiServer{
-		store:   newDownloadStore(),
-		baseURL: strings.TrimSpace(os.Getenv("BASE_URL")),
-		ttl:     ttl,
+		store:             newDownloadStore(),
+		baseURL:           strings.TrimSpace(os.Getenv("BASE_URL")),
+		bindAddr:          bindAddr,
+		ttl:               ttl,
+		ffmpegAutoInstall: ffmpegAutoInstall,
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -214,15 +228,17 @@ func main() {
 	mux.HandleFunc("/v1/download/", server.handleDownloadByToken)
 	mux.HandleFunc("/", server.handleRoot)
 
+	listenAddr := net.JoinHostPort(bindAddr, port)
 	httpServer := &http.Server{
-		Addr:              ":" + port,
+		Addr:              listenAddr,
 		Handler:           withCORS(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 	}
 
-	log.Printf("REST API listening on http://localhost:%s", port)
+	log.Printf("REST API listening on http://%s", listenAddr)
 	log.Printf("Token TTL: %s", ttl)
+	log.Printf("FFmpeg auto-install: %t", ffmpegAutoInstall)
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatalf("server error: %v", err)
 	}
@@ -283,6 +299,11 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 			override = 24 * time.Hour
 		}
 		ttl = override
+	}
+
+	if err := s.ensureFFmpegBinaries(); err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, errorResponse{OK: false, Error: err.Error()})
+		return
 	}
 
 	downloadPath, serviceUsed, spotifyID, attempts, err := resolveWithFallback(req.SpotifyURL, serviceOrder)
@@ -590,6 +611,65 @@ func (s *apiServer) publicBaseURL(r *http.Request) string {
 	}
 
 	return fmt.Sprintf("%s://%s", scheme, r.Host)
+}
+
+func (s *apiServer) ensureFFmpegBinaries() error {
+	if !s.ffmpegAutoInstall {
+		return nil
+	}
+
+	s.ffmpegMu.Lock()
+	defer s.ffmpegMu.Unlock()
+
+	if s.ffmpegReady {
+		return nil
+	}
+
+	ffmpegInstalled, err := backend.IsFFmpegInstalled()
+	if err != nil {
+		log.Printf("FFmpeg check error: %v", err)
+	}
+
+	ffprobeInstalled, err := backend.IsFFprobeInstalled()
+	if err != nil {
+		log.Printf("FFprobe check error: %v", err)
+	}
+
+	if ffmpegInstalled && ffprobeInstalled {
+		s.ffmpegReady = true
+		return nil
+	}
+
+	log.Printf("FFmpeg/FFprobe not available, auto-installing...")
+	if err := backend.DownloadFFmpeg(nil); err != nil {
+		return fmt.Errorf("failed to auto-install ffmpeg: %w", err)
+	}
+
+	ffmpegInstalled, _ = backend.IsFFmpegInstalled()
+	ffprobeInstalled, _ = backend.IsFFprobeInstalled()
+	if !ffmpegInstalled || !ffprobeInstalled {
+		return fmt.Errorf("ffmpeg bootstrap incomplete (ffmpeg=%t, ffprobe=%t)", ffmpegInstalled, ffprobeInstalled)
+	}
+
+	s.ffmpegReady = true
+	log.Printf("FFmpeg auto-install completed")
+	return nil
+}
+
+func envBoolDefaultTrue(name string) bool {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(name)))
+	if raw == "" {
+		return true
+	}
+
+	switch raw {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return true
+	}
 }
 
 func generateToken() (string, error) {
