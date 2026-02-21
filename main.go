@@ -640,6 +640,17 @@ func (s *apiServer) ensureFFmpegBinaries() error {
 		return nil
 	}
 
+	homeDir, homeSource, err := ensureHomeEnv()
+	if err != nil {
+		return fmt.Errorf("failed to prepare HOME for ffmpeg bootstrap: %w", err)
+	}
+	if homeSource == "user-home" {
+		log.Printf("HOME is not defined; using os.UserHomeDir()=%s for ffmpeg bootstrap", homeDir)
+	}
+	if homeSource == "fallback" {
+		log.Printf("HOME is not defined; using fallback HOME=%s for ffmpeg bootstrap", homeDir)
+	}
+
 	log.Printf("FFmpeg/FFprobe not available, auto-installing...")
 	if err := backend.DownloadFFmpeg(nil); err != nil {
 		return fmt.Errorf("failed to auto-install ffmpeg: %w", err)
@@ -654,6 +665,34 @@ func (s *apiServer) ensureFFmpegBinaries() error {
 	s.ffmpegReady = true
 	log.Printf("FFmpeg auto-install completed")
 	return nil
+}
+
+func ensureHomeEnv() (homeDir string, source string, err error) {
+	homeDir = strings.TrimSpace(os.Getenv("HOME"))
+	if homeDir != "" {
+		return homeDir, "env", nil
+	}
+
+	userHome, userHomeErr := os.UserHomeDir()
+	userHome = strings.TrimSpace(userHome)
+	if userHomeErr == nil && userHome != "" {
+		if _, statErr := os.Stat(userHome); statErr == nil {
+			if err := os.Setenv("HOME", userHome); err != nil {
+				return "", "", err
+			}
+			return userHome, "user-home", nil
+		}
+	}
+
+	homeDir = filepath.Join(os.TempDir(), "spotiflac-home")
+	if err := os.MkdirAll(homeDir, 0o755); err != nil {
+		return "", "", err
+	}
+	if err := os.Setenv("HOME", homeDir); err != nil {
+		return "", "", err
+	}
+
+	return homeDir, "fallback", nil
 }
 
 func envBoolDefaultTrue(name string) bool {
