@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"spotiflac/backend"
+	"github.com/afkarxyz/SpotiFLAC/backend"
 )
 
 var (
@@ -468,6 +468,8 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 			spotifyURL,
 			true,
 			false,
+			false,
+			false,
 		)
 
 	case "qobuz":
@@ -496,6 +498,8 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 			spotifyURL,
 			true,
 			false,
+			false,
+			false,
 		)
 
 	case "amazon":
@@ -523,6 +527,8 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 			meta.Copyright,
 			meta.Publisher,
 			spotifyURL,
+			false,
+			false,
 			false,
 		)
 	default:

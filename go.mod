@@ -1,8 +1,8 @@
 module spotiflacapi
 
-go 1.25.5
+go 1.26
 
-require spotiflac v0.0.0
+require github.com/afkarxyz/SpotiFLAC v0.0.0-20260226072000-00d3fb921216
 
 require (
 	github.com/bogem/id3v2/v2 v2.1.4 // indirect
@@ -23,5 +23,3 @@ require (
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.31.0 // indirect
 )
-
-replace spotiflac => github.com/afkarxyz/SpotiFLAC v0.0.0-20260212123831-1314c14c592f

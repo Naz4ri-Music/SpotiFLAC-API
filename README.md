@@ -162,12 +162,12 @@ curl -L -o track.flac "http://127.0.0.1:9000/v1/download/<token>"
 
 ## Dependency management (SpotiFLAC upstream)
 
-SpotiFLAC currently uses `module spotiflac`, so this project pins upstream using `replace` in `go.mod`.
+SpotiFLAC now uses `module github.com/afkarxyz/SpotiFLAC`, so this project pins upstream directly as a normal module requirement in `go.mod`.
 
 Current pin:
 
-- Commit: `1314c14c592f79058823b7fa99bd92c4f1922ac5`
-- Pseudo-version: `v0.0.0-20260212123831-1314c14c592f`
+- Commit: `00d3fb921216`
+- Pseudo-version: `v0.0.0-20260226072000-00d3fb921216`
 
 Update to latest upstream commit:
 
@@ -178,7 +178,7 @@ Update to latest upstream commit:
 Or pin a specific pseudo-version:
 
 ```bash
-./scripts/pin-upstream.sh v0.0.0-20260212123831-1314c14c592f
+./scripts/pin-upstream.sh v0.0.0-20260226072000-00d3fb921216
 ```
 
 After changing upstream:

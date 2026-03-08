@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO="https://github.com/afkarxyz/SpotiFLAC.git"
 API_URL="https://api.github.com/repos/afkarxyz/SpotiFLAC/commits"
+MODULE_PATH="github.com/afkarxyz/SpotiFLAC"
 
 build_pseudo_from_sha() {
   local sha="$1"
@@ -26,7 +27,7 @@ build_pseudo_from_sha() {
 if [ "$#" -gt 1 ]; then
   echo "Usage: $0 [pseudo-version|latest]"
   echo "Example: $0 latest"
-  echo "Example: $0 v0.0.0-20260212123831-1314c14c592f"
+  echo "Example: $0 v0.0.0-20260226072000-00d3fb921216"
   exit 1
 fi
 
@@ -43,7 +44,7 @@ else
   VERSION="$1"
 fi
 
-go mod edit -replace="spotiflac=github.com/afkarxyz/SpotiFLAC@${VERSION}"
+go get "${MODULE_PATH}@${VERSION}"
 go mod tidy
 
 echo "Upstream pinned to ${VERSION}"
