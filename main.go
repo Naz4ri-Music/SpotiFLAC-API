@@ -540,7 +540,7 @@ func fetchTrackMetadata(spotifyURL string) (trackMetadata, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	data, err := backend.GetFilteredSpotifyData(ctx, spotifyURL, false, 0)
+	data, err := backend.GetFilteredSpotifyData(ctx, spotifyURL, false, 0, "", nil)
 	if err != nil {
 		return trackMetadata{}, err
 	}
