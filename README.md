@@ -10,6 +10,7 @@ REST API wrapper for [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC) focused 
 
 - Spotify track input (`https://open.spotify.com/track/...`, `spotify:track:...`, or raw track ID).
 - Provider fallback chain (default order: `tidal -> qobuz -> amazon`).
+- Download engine selector: `auto`, `spotiflac`, or `monochrome`.
 - Temporary tokenized download URLs (`GET /v1/download/{token}`).
 - In-memory token store with TTL-based cleanup.
 - CORS enabled (`*`) for frontend/API integrations.
@@ -18,10 +19,10 @@ REST API wrapper for [SpotiFLAC](https://github.com/afkarxyz/SpotiFLAC) focused 
 ## Architecture
 
 - `POST /v1/download-url`
-  - Validates input and provider order.
+  - Validates input, provider order, and download engine.
   - Ensures `ffmpeg/ffprobe` are available (auto-install if missing and enabled).
   - Fetches Spotify metadata through SpotiFLAC backend.
-  - Tries providers in order until one succeeds.
+  - Uses `spotiflac`, `monochrome`, or `auto` fallback mode.
   - Stores file path + token + expiry in memory.
   - Returns a public download URL.
 - `GET /v1/download/{token}`
@@ -55,9 +56,22 @@ BIND_ADDR=127.0.0.1 PORT=9000 BASE_URL=http://127.0.0.1:9000 go run .
 - `PORT`: HTTP port (default: `8080`)
 - `DOWNLOAD_TTL`: token TTL as Go duration (default: `2h`, example: `30m`)
 - `BASE_URL`: optional public base URL used when building `download_url`
+- `HTTP_CLIENT_TIMEOUT`: timeout for outbound HTTP calls from this API (default: `20s`)
 - `FFMPEG_AUTO_INSTALL`: auto-install `ffmpeg/ffprobe` when missing (default: `true`)
   - accepted true values: `1`, `true`, `yes`, `on`
   - accepted false values: `0`, `false`, `no`, `off`
+- `SPOTIFY_METADATA_TIMEOUT`: timeout for Spotify metadata resolution through SpotiFLAC (default: `45s`)
+- `MONOCHROME_DISCOVERY_URLS`: optional comma-separated list of discovery endpoints that return current Monochrome instances
+- `MONOCHROME_API_INSTANCES`: optional comma-separated override for Monochrome search/info instances
+- `MONOCHROME_STREAMING_INSTANCES`: optional comma-separated override for Monochrome streaming/manifest instances
+- `MONOCHROME_TIDAL_CLIENT_ID`: optional override for the browser client id used by Monochrome
+- `MONOCHROME_TIDAL_CLIENT_SECRET`: optional override for the browser client secret used by Monochrome
+
+Defaults are kept in code. For day-to-day maintenance, the env surface is intentionally limited to what is most likely to change operationally: discovery URLs, Monochrome instance lists, and optional TIDAL browser credentials.
+
+Official TIDAL URLs and Monochrome endpoint paths are fixed in code on purpose. If those ever change, that is a code update rather than an `.env` update.
+
+There is also a ready-to-edit example file in `/Users/mariano.palomo/Dev/SpotiFLACAPI/.env.example`.
 
 Example:
 
@@ -91,7 +105,8 @@ Request body:
 {
   "spotify_url": "https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp",
   "services": ["tidal", "qobuz", "amazon"],
-  "ttl_seconds": 3600
+  "ttl_seconds": 3600,
+  "engine": "auto"
 }
 ```
 
@@ -100,6 +115,9 @@ Notes:
 - `spotify_url` is required.
 - `services` is optional; default order is `["tidal", "qobuz", "amazon"]`.
 - `ttl_seconds` is optional and capped server-side.
+- `engine` is optional; valid values are `auto`, `spotiflac`, and `monochrome`.
+- `method` is accepted as an alias of `engine` in the JSON body.
+- `?engine=...` and `?method=...` in the request URL override the JSON body and are useful to force a mode during testing.
 
 Success response:
 
@@ -108,6 +126,7 @@ Success response:
   "ok": true,
   "spotify_id": "3n3Ppam7vgaVa1iaRUc9Lp",
   "service": "tidal",
+  "method": "spotiflac",
   "filename": "Track - Artist.flac",
   "download_url": "http://127.0.0.1:9000/v1/download/<token>",
   "expires_at": "2026-02-21T12:00:00Z",
@@ -154,6 +173,23 @@ curl -s -X POST http://127.0.0.1:9000/v1/download-url \
   -d '{"spotify_url":"https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp"}'
 ```
 
+Force Monochrome for testing:
+
+```bash
+curl -s -X POST 'http://127.0.0.1:9000/v1/download-url?engine=monochrome' \
+  -H 'Content-Type: application/json' \
+  -d '{"spotify_url":"https://open.spotify.com/track/3n3Ppam7vgaVa1iaRUc9Lp"}'
+```
+
+Force custom Monochrome settings from environment:
+
+```bash
+MONOCHROME_DISCOVERY_URLS=https://example-worker-1.dev,https://example-worker-2.dev \
+MONOCHROME_API_INSTANCES=https://api-a.example,https://api-b.example \
+MONOCHROME_STREAMING_INSTANCES=https://stream-a.example,https://stream-b.example \
+go run .
+```
+
 Then open the returned `download_url` in a browser or fetch it with:
 
 ```bash
@@ -166,8 +202,8 @@ SpotiFLAC now uses `module github.com/afkarxyz/SpotiFLAC`, so this project pins 
 
 Current pin:
 
-- Commit: `f13359df7f71`
-- Pseudo-version: `v0.0.0-20260325140645-f13359df7f71`
+- Commit: `59a057b14a65`
+- Pseudo-version: `v0.0.0-20260403054616-59a057b14a65`
 
 Update to latest upstream commit:
 
@@ -178,7 +214,7 @@ Update to latest upstream commit:
 Or pin a specific pseudo-version:
 
 ```bash
-./scripts/pin-upstream.sh v0.0.0-20260325140645-f13359df7f71
+./scripts/pin-upstream.sh v0.0.0-20260403054616-59a057b14a65
 ```
 
 After changing upstream:

@@ -1,17 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -22,9 +26,11 @@ import (
 )
 
 var (
-	spotifyTrackRegex = regexp.MustCompile(`(?i)(?:spotify:track:|https?://open\.spotify\.com/(?:intl-[^/]+/)?track/)([A-Za-z0-9]{22})`)
-	spotifyIDRegex    = regexp.MustCompile(`^[A-Za-z0-9]{22}$`)
-	validServices     = map[string]struct{}{
+	spotifyTrackURLBase = ensureTrailingSlash(envStringDefault("SPOTIFY_TRACK_URL_BASE", "https://open.spotify.com/track"))
+	spotifyTrackRegex   = mustCompileRegexFromEnv("SPOTIFY_TRACK_URL_REGEX", `(?i)(?:spotify:track:|https?://open\.spotify\.com/(?:intl-[^/]+/)?track/)([A-Za-z0-9]{22})`)
+	spotifyIDRegex      = regexp.MustCompile(`^[A-Za-z0-9]{22}$`)
+	normalizeTextRegex  = regexp.MustCompile(`[^a-z0-9]+`)
+	validServices       = map[string]struct{}{
 		"tidal":  {},
 		"qobuz":  {},
 		"amazon": {},
@@ -32,12 +38,65 @@ var (
 	defaultServices = []string{"tidal", "qobuz", "amazon"}
 )
 
+const (
+	downloadEngineAuto                              = "auto"
+	downloadEngineSpotiFLAC                         = "spotiflac"
+	downloadEngineMonochrome                        = "monochrome"
+	defaultMonochromeTidalAuthURL                   = "https://auth.tidal.com/v1/oauth2/token"
+	defaultMonochromeTidalAPIBaseURL                = "https://api.tidal.com/v1"
+	defaultMonochromeTidalOpenAPIBaseURL            = "https://openapi.tidal.com/v2"
+	defaultMonochromeTidalTrackManifestPathTemplate = "/trackManifests/%d"
+	defaultMonochromeTidalPlaybackInfoPathTemplate  = "/tracks/%d/playbackinfo"
+	defaultMonochromeTidalClientID                  = "txNoH4kkV41MfH25"
+	defaultMonochromeTidalClientSecret              = "dQjy0MinCEvxi1O4UmxvxWnDjt4cgHBPw8ll6nYBk98="
+	defaultMonochromeTidalCountryCode               = "US"
+	defaultMonochromeDiscoveryPath                  = ""
+	defaultMonochromeSearchEndpointPath             = "/search/"
+	defaultMonochromeTrackEndpointPath              = "/track/"
+	defaultMonochromeTrackManifestsPath             = "/trackManifests/"
+)
+
+var validDownloadEngines = map[string]struct{}{
+	downloadEngineAuto:       {},
+	downloadEngineSpotiFLAC:  {},
+	downloadEngineMonochrome: {},
+}
+
+var defaultMonochromeAPIInstances = []string{
+	"https://hifi.geeked.wtf",
+	"https://eu-central.monochrome.tf",
+	"https://us-west.monochrome.tf",
+	"https://api.monochrome.tf",
+	"https://monochrome-api.samidy.com",
+	"https://maus.qqdl.site",
+	"https://vogel.qqdl.site",
+	"https://katze.qqdl.site",
+	"https://hund.qqdl.site",
+	"https://tidal.kinoplus.online",
+	"https://wolf.qqdl.site",
+}
+
+var defaultMonochromeDiscoveryURLs = []string{
+	"https://tidal-uptime.jiffy-puffs-1j.workers.dev/",
+	"https://tidal-uptime.props-76styles.workers.dev/",
+}
+
+var defaultMonochromeStreamingInstances = []string{
+	"https://hifi.geeked.wtf",
+	"https://maus.qqdl.site",
+	"https://vogel.qqdl.site",
+	"https://katze.qqdl.site",
+	"https://hund.qqdl.site",
+	"https://wolf.qqdl.site",
+}
+
 type trackMetadata struct {
 	SpotifyID   string `json:"spotify_id"`
 	Artists     string `json:"artists"`
 	Name        string `json:"name"`
 	AlbumName   string `json:"album_name"`
 	AlbumArtist string `json:"album_artist"`
+	ISRC        string `json:"isrc"`
 	Images      string `json:"images"`
 	ReleaseDate string `json:"release_date"`
 	TrackNumber int    `json:"track_number"`
@@ -52,6 +111,10 @@ type trackResponse struct {
 	Track trackMetadata `json:"track"`
 }
 
+type artist struct {
+	Name string `json:"name"`
+}
+
 type attempt struct {
 	Service string `json:"service"`
 	Error   string `json:"error,omitempty"`
@@ -61,12 +124,15 @@ type createDownloadRequest struct {
 	SpotifyURL string   `json:"spotify_url"`
 	Services   []string `json:"services,omitempty"`
 	TTLSeconds int      `json:"ttl_seconds,omitempty"`
+	Engine     string   `json:"engine,omitempty"`
+	Method     string   `json:"method,omitempty"`
 }
 
 type createDownloadResponse struct {
 	OK          bool      `json:"ok"`
 	SpotifyID   string    `json:"spotify_id,omitempty"`
 	Service     string    `json:"service,omitempty"`
+	Method      string    `json:"method,omitempty"`
 	Filename    string    `json:"filename,omitempty"`
 	DownloadURL string    `json:"download_url,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at,omitempty"`
@@ -180,6 +246,7 @@ type apiServer struct {
 	baseURL           string
 	bindAddr          string
 	ttl               time.Duration
+	httpClient        *http.Client
 	ffmpegAutoInstall bool
 	ffmpegMu          sync.Mutex
 	ffmpegReady       bool
@@ -215,6 +282,7 @@ func main() {
 		baseURL:           strings.TrimSpace(os.Getenv("BASE_URL")),
 		bindAddr:          bindAddr,
 		ttl:               ttl,
+		httpClient:        &http.Client{Timeout: envDurationDefault("HTTP_CLIENT_TIMEOUT", 20*time.Second)},
 		ffmpegAutoInstall: ffmpegAutoInstall,
 	}
 
@@ -286,6 +354,12 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	engine, err := requestedDownloadEngine(req, r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: err.Error()})
+		return
+	}
+
 	serviceOrder := normalizeServiceOrder(req.Services)
 	if len(serviceOrder) == 0 {
 		writeJSON(w, http.StatusBadRequest, errorResponse{OK: false, Error: "no valid services in services[]"})
@@ -306,7 +380,7 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	downloadPath, serviceUsed, spotifyID, attempts, err := resolveWithFallback(req.SpotifyURL, serviceOrder)
+	downloadPath, serviceUsed, methodUsed, spotifyID, attempts, err := s.resolveDownload(req.SpotifyURL, serviceOrder, engine)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, createDownloadResponse{
 			OK:       false,
@@ -327,6 +401,7 @@ func (s *apiServer) handleCreateDownloadURL(w http.ResponseWriter, r *http.Reque
 		OK:          true,
 		SpotifyID:   spotifyID,
 		Service:     serviceUsed,
+		Method:      methodUsed,
 		Filename:    filepath.Base(entry.Path),
 		DownloadURL: downloadURL,
 		ExpiresAt:   entry.ExpiresAt.UTC(),
@@ -391,23 +466,163 @@ func (s *apiServer) handleDownloadByToken(w http.ResponseWriter, r *http.Request
 	http.ServeContent(w, r, filename, info.ModTime(), file)
 }
 
-func resolveWithFallback(spotifyInput string, serviceOrder []string) (downloadPath, serviceUsed, spotifyID string, attempts []attempt, err error) {
-	spotifyID, err = extractSpotifyTrackID(spotifyInput)
-	if err != nil {
-		return "", "", "", nil, err
+type monochromeClient struct {
+	httpClient                 *http.Client
+	apiInstances               []string
+	streamingInstances         []string
+	discoveryURLs              []string
+	explicitAPIInstances       bool
+	explicitStreamingInstances bool
+	discoveryPath              string
+	searchEndpointPath         string
+	trackEndpointPath          string
+	trackManifestsPath         string
+	tidalAuthURL               string
+	tidalAPIBaseURL            string
+	tidalOpenAPIBaseURL        string
+	tidalTrackManifestPath     string
+	tidalPlaybackInfoPath      string
+	tidalClientID              string
+	tidalClientSecret          string
+	tidalCountryCode           string
+	tokenMu                    sync.Mutex
+	token                      string
+	tokenExpiry                time.Time
+	discoveryOnce              sync.Once
+}
+
+type monochromeSearchResponse struct {
+	Data struct {
+		Items []monochromeTrack `json:"items"`
+	} `json:"data"`
+}
+
+type monochromeTrackManifestResponse struct {
+	Data struct {
+		Data struct {
+			Attributes struct {
+				URI string `json:"uri"`
+			} `json:"attributes"`
+		} `json:"data"`
+	} `json:"data"`
+}
+
+type monochromePlaybackInfo struct {
+	URL              string `json:"url"`
+	StreamURL        string `json:"streamUrl"`
+	OriginalTrackURL string `json:"OriginalTrackUrl"`
+	Manifest         string `json:"manifest"`
+	ManifestURL      string `json:"manifestUrl"`
+	ManifestMimeType string `json:"manifestMimeType"`
+}
+
+type monochromeTrackRouteResponse struct {
+	Data monochromePlaybackInfo `json:"data"`
+}
+
+type monochromeTidalTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	ExpiresIn   int    `json:"expires_in"`
+}
+
+type monochromeInstancesPayload struct {
+	API       []monochromeInstance `json:"api"`
+	Streaming []monochromeInstance `json:"streaming"`
+}
+
+type monochromeInstance struct {
+	URL string `json:"url"`
+}
+
+type monochromeTrack struct {
+	ID           int64    `json:"id"`
+	Title        string   `json:"title"`
+	Version      string   `json:"version"`
+	ISRC         string   `json:"isrc"`
+	AudioQuality string   `json:"audioQuality"`
+	StreamReady  bool     `json:"streamReady"`
+	Artists      []artist `json:"artists"`
+	Album        struct {
+		Title string `json:"title"`
+	} `json:"album"`
+}
+
+func requestedDownloadEngine(req createDownloadRequest, r *http.Request) (string, error) {
+	engine := firstNonEmpty(
+		strings.TrimSpace(r.URL.Query().Get("engine")),
+		strings.TrimSpace(r.URL.Query().Get("method")),
+		strings.TrimSpace(req.Engine),
+		strings.TrimSpace(req.Method),
+	)
+	if engine == "" {
+		return downloadEngineAuto, nil
 	}
 
-	spotifyURL := "https://open.spotify.com/track/" + spotifyID
+	engine = strings.ToLower(engine)
+	if _, ok := validDownloadEngines[engine]; !ok {
+		return "", fmt.Errorf("invalid engine %q: valid values are auto, spotiflac, monochrome", engine)
+	}
+
+	return engine, nil
+}
+
+func (s *apiServer) resolveDownload(spotifyInput string, serviceOrder []string, engine string) (downloadPath, serviceUsed, methodUsed, spotifyID string, attempts []attempt, err error) {
+	spotifyID, err = extractSpotifyTrackID(spotifyInput)
+	if err != nil {
+		return "", "", "", "", nil, err
+	}
+
+	spotifyURL := spotifyTrackURLBase + spotifyID
 	meta, err := fetchTrackMetadata(spotifyURL)
 	if err != nil {
-		return "", "", spotifyID, nil, fmt.Errorf("failed to fetch Spotify metadata: %w", err)
+		return "", "", "", spotifyID, nil, fmt.Errorf("failed to fetch Spotify metadata: %w", err)
 	}
 
 	workDir, err := os.MkdirTemp("", "spotiflac-rest-")
 	if err != nil {
-		return "", "", spotifyID, nil, fmt.Errorf("failed to create temp directory: %w", err)
+		return "", "", "", spotifyID, nil, fmt.Errorf("failed to create temp directory: %w", err)
 	}
+	cleanupWorkDir := true
+	defer func() {
+		if cleanupWorkDir {
+			_ = os.RemoveAll(workDir)
+		}
+	}()
 
+	switch engine {
+	case downloadEngineSpotiFLAC:
+		downloadPath, serviceUsed, attempts, err = s.resolveWithSpotiFLAC(spotifyID, spotifyURL, meta, serviceOrder, workDir)
+		if err != nil {
+			return "", "", "", spotifyID, attempts, err
+		}
+		cleanupWorkDir = false
+		return downloadPath, serviceUsed, downloadEngineSpotiFLAC, spotifyID, attempts, nil
+	case downloadEngineMonochrome:
+		downloadPath, attempts, err = s.resolveWithMonochrome(meta, workDir)
+		if err != nil {
+			return "", "", "", spotifyID, attempts, err
+		}
+		cleanupWorkDir = false
+		return downloadPath, downloadEngineMonochrome, downloadEngineMonochrome, spotifyID, attempts, nil
+	default:
+		downloadPath, serviceUsed, attempts, err = s.resolveWithSpotiFLAC(spotifyID, spotifyURL, meta, serviceOrder, workDir)
+		if err == nil {
+			cleanupWorkDir = false
+			return downloadPath, serviceUsed, downloadEngineSpotiFLAC, spotifyID, attempts, nil
+		}
+
+		monochromePath, monochromeAttempts, monochromeErr := s.resolveWithMonochrome(meta, workDir)
+		attempts = append(attempts, monochromeAttempts...)
+		if monochromeErr == nil {
+			cleanupWorkDir = false
+			return monochromePath, downloadEngineMonochrome, downloadEngineMonochrome, spotifyID, attempts, nil
+		}
+
+		return "", "", "", spotifyID, attempts, fmt.Errorf("spotiflac failed: %v; monochrome failed: %w", err, monochromeErr)
+	}
+}
+
+func (s *apiServer) resolveWithSpotiFLAC(spotifyID, spotifyURL string, meta trackMetadata, serviceOrder []string, workDir string) (downloadPath, serviceUsed string, attempts []attempt, err error) {
 	for _, service := range serviceOrder {
 		serviceDir := filepath.Join(workDir, service)
 		filename, dlErr := runServiceDownload(service, spotifyID, spotifyURL, meta, serviceDir)
@@ -433,11 +648,38 @@ func resolveWithFallback(spotifyInput string, serviceOrder []string) (downloadPa
 		}
 
 		attempts = append(attempts, attempt{Service: service})
-		return filename, service, spotifyID, attempts, nil
+		return filename, service, attempts, nil
 	}
 
-	_ = os.RemoveAll(workDir)
-	return "", "", spotifyID, attempts, fmt.Errorf("failed in all services: %s", strings.Join(serviceOrder, " -> "))
+	return "", "", attempts, fmt.Errorf("failed in all services: %s", strings.Join(serviceOrder, " -> "))
+}
+
+func (s *apiServer) resolveWithMonochrome(meta trackMetadata, workDir string) (string, []attempt, error) {
+	attempts := make([]attempt, 0, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	client := newMonochromeClient(s.httpClient)
+	track, err := client.searchTrack(ctx, meta)
+	if err != nil {
+		attempts = append(attempts, attempt{Service: downloadEngineMonochrome, Error: err.Error()})
+		return "", attempts, err
+	}
+
+	manifestURI, err := client.getTrackManifestURI(ctx, track.ID)
+	if err != nil {
+		attempts = append(attempts, attempt{Service: downloadEngineMonochrome, Error: err.Error()})
+		return "", attempts, err
+	}
+
+	outputPath := filepath.Join(workDir, downloadEngineMonochrome, buildMonochromeFilename(meta))
+	if err := downloadMonochromeTrack(ctx, manifestURI, outputPath, meta); err != nil {
+		attempts = append(attempts, attempt{Service: downloadEngineMonochrome, Error: err.Error()})
+		return "", attempts, err
+	}
+
+	attempts = append(attempts, attempt{Service: downloadEngineMonochrome})
+	return outputPath, attempts, nil
 }
 
 func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadata, outputDir string) (string, error) {
@@ -536,8 +778,712 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 	}
 }
 
+func newMonochromeClient(httpClient *http.Client) *monochromeClient {
+	apiInstances, explicitAPIInstances := splitCSVEnvWithSource("MONOCHROME_API_INSTANCES", defaultMonochromeAPIInstances)
+	streamingInstances, explicitStreamingInstances := splitCSVEnvWithSource("MONOCHROME_STREAMING_INSTANCES", defaultMonochromeStreamingInstances)
+
+	return &monochromeClient{
+		httpClient:                 httpClient,
+		apiInstances:               apiInstances,
+		streamingInstances:         streamingInstances,
+		discoveryURLs:              splitCSVEnv("MONOCHROME_DISCOVERY_URLS", defaultMonochromeDiscoveryURLs),
+		explicitAPIInstances:       explicitAPIInstances,
+		explicitStreamingInstances: explicitStreamingInstances,
+		discoveryPath:              defaultMonochromeDiscoveryPath,
+		searchEndpointPath:         defaultMonochromeSearchEndpointPath,
+		trackEndpointPath:          defaultMonochromeTrackEndpointPath,
+		trackManifestsPath:         defaultMonochromeTrackManifestsPath,
+		tidalAuthURL:               defaultMonochromeTidalAuthURL,
+		tidalAPIBaseURL:            defaultMonochromeTidalAPIBaseURL,
+		tidalOpenAPIBaseURL:        defaultMonochromeTidalOpenAPIBaseURL,
+		tidalTrackManifestPath:     defaultMonochromeTidalTrackManifestPathTemplate,
+		tidalPlaybackInfoPath:      defaultMonochromeTidalPlaybackInfoPathTemplate,
+		tidalClientID:              envStringDefault("MONOCHROME_TIDAL_CLIENT_ID", defaultMonochromeTidalClientID),
+		tidalClientSecret:          envStringDefault("MONOCHROME_TIDAL_CLIENT_SECRET", defaultMonochromeTidalClientSecret),
+		tidalCountryCode:           defaultMonochromeTidalCountryCode,
+	}
+}
+
+func (c *monochromeClient) searchTrack(ctx context.Context, meta trackMetadata) (monochromeTrack, error) {
+	c.loadDiscoveredInstances(ctx)
+
+	queries := monochromeSearchQueries(meta)
+	bestScore := -1
+	var bestTrack monochromeTrack
+	var lastErr error
+
+	for _, query := range queries {
+		for _, instance := range c.apiInstances {
+			var payload monochromeSearchResponse
+			if err := c.getJSON(ctx, instance, c.searchEndpointPath+"?s="+url.QueryEscape(query), &payload); err != nil {
+				lastErr = err
+				continue
+			}
+
+			track, score, ok := bestMonochromeCandidate(payload.Data.Items, meta)
+			if !ok {
+				continue
+			}
+			if score > bestScore {
+				bestScore = score
+				bestTrack = track
+			}
+		}
+		if bestScore >= 120 {
+			return bestTrack, nil
+		}
+	}
+
+	if bestScore >= 0 {
+		return bestTrack, nil
+	}
+	if lastErr != nil {
+		return monochromeTrack{}, fmt.Errorf("monochrome search failed: %w", lastErr)
+	}
+	return monochromeTrack{}, fmt.Errorf("monochrome search returned no matching track")
+}
+
+func (c *monochromeClient) getTrackManifestURI(ctx context.Context, trackID int64) (string, error) {
+	c.loadDiscoveredInstances(ctx)
+
+	if uri, err := c.getOfficialTrackManifestURI(ctx, trackID); err == nil && strings.TrimSpace(uri) != "" {
+		return uri, nil
+	}
+
+	params := url.Values{}
+	params.Set("id", fmt.Sprintf("%d", trackID))
+	params.Add("formats", "FLAC")
+	params.Add("formats", "FLAC_HIRES")
+	params.Set("adaptive", "true")
+	params.Set("manifestType", "MPEG_DASH")
+	params.Set("uriScheme", "HTTPS")
+	params.Set("usage", "PLAYBACK")
+
+	var lastErr error
+	for _, instance := range c.streamingInstances {
+		var payload monochromeTrackManifestResponse
+		if err := c.getJSON(ctx, instance, c.trackManifestsPath+"?"+params.Encode(), &payload); err != nil {
+			lastErr = err
+			continue
+		}
+		uri := strings.TrimSpace(payload.Data.Data.Attributes.URI)
+		if uri != "" {
+			return uri, nil
+		}
+		lastErr = fmt.Errorf("empty uri from %s", instance)
+	}
+
+	if uri, err := c.getOfficialPlaybackInfoURI(ctx, trackID); err == nil && strings.TrimSpace(uri) != "" {
+		return uri, nil
+	} else if err != nil {
+		lastErr = err
+	}
+
+	for _, instance := range c.apiInstances {
+		var payload monochromeTrackRouteResponse
+		if err := c.getJSON(ctx, instance, fmt.Sprintf("%s?id=%d&quality=LOSSLESS", c.trackEndpointPath, trackID), &payload); err != nil {
+			lastErr = err
+			continue
+		}
+
+		uri, err := resolvePlaybackInfoURI(payload.Data)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return uri, nil
+	}
+
+	if lastErr != nil {
+		return "", fmt.Errorf("monochrome manifest lookup failed: %w", lastErr)
+	}
+	return "", fmt.Errorf("monochrome manifest lookup failed")
+}
+
+func (c *monochromeClient) loadDiscoveredInstances(ctx context.Context) {
+	c.discoveryOnce.Do(func() {
+		if c.explicitAPIInstances && c.explicitStreamingInstances {
+			return
+		}
+
+		discoveredAPI, discoveredStreaming := c.discoverInstances(ctx)
+		if !c.explicitAPIInstances && len(discoveredAPI) > 0 {
+			c.apiInstances = discoveredAPI
+		}
+		if !c.explicitStreamingInstances {
+			if len(discoveredStreaming) > 0 {
+				c.streamingInstances = discoveredStreaming
+			} else if len(discoveredAPI) > 0 {
+				c.streamingInstances = append([]string(nil), discoveredAPI...)
+			}
+		}
+	})
+}
+
+func (c *monochromeClient) discoverInstances(ctx context.Context) ([]string, []string) {
+	for _, discoveryURL := range c.discoveryURLs {
+		var payload monochromeInstancesPayload
+		if err := c.getJSON(ctx, discoveryURL, c.discoveryPath, &payload); err != nil {
+			continue
+		}
+
+		apiInstances := normalizeMonochromeInstanceURLs(payload.API)
+		streamingInstances := normalizeMonochromeInstanceURLs(payload.Streaming)
+		if len(apiInstances) == 0 && len(streamingInstances) == 0 {
+			continue
+		}
+		return apiInstances, streamingInstances
+	}
+
+	return nil, nil
+}
+
+func (c *monochromeClient) getOfficialTrackManifestURI(ctx context.Context, trackID int64) (string, error) {
+	token, err := c.getTidalToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	params := url.Values{}
+	params.Set("adaptive", "true")
+	params.Set("manifestType", "MPEG_DASH")
+	params.Set("uriScheme", "HTTPS")
+	params.Set("usage", "PLAYBACK")
+	params.Add("formats", "FLAC")
+	params.Add("formats", "FLAC_HIRES")
+
+	requestURL := joinBaseURLAndPath(c.tidalOpenAPIBaseURL, fmt.Sprintf(c.tidalTrackManifestPath, trackID)) + "?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	var payload monochromeTrackManifestResponse
+	if err := c.doJSON(req, &payload); err != nil {
+		return "", err
+	}
+
+	uri := strings.TrimSpace(payload.Data.Data.Attributes.URI)
+	if uri == "" {
+		return "", fmt.Errorf("official track manifest returned empty uri")
+	}
+	return uri, nil
+}
+
+func (c *monochromeClient) getOfficialPlaybackInfoURI(ctx context.Context, trackID int64) (string, error) {
+	token, err := c.getTidalToken(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	params := url.Values{}
+	params.Set("audioquality", "LOSSLESS")
+	params.Set("playbackmode", "STREAM")
+	params.Set("assetpresentation", "FULL")
+	params.Set("countryCode", c.tidalCountryCode)
+	params.Set("immersiveAudio", "false")
+
+	requestURL := joinBaseURLAndPath(c.tidalAPIBaseURL, fmt.Sprintf(c.tidalPlaybackInfoPath, trackID)) + "?" + params.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	var payload monochromePlaybackInfo
+	if err := c.doJSON(req, &payload); err != nil {
+		return "", err
+	}
+
+	return resolvePlaybackInfoURI(payload)
+}
+
+func (c *monochromeClient) getTidalToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	defer c.tokenMu.Unlock()
+
+	if c.token != "" && time.Now().Before(c.tokenExpiry) {
+		return c.token, nil
+	}
+
+	form := url.Values{}
+	form.Set("client_id", c.tidalClientID)
+	form.Set("client_secret", c.tidalClientSecret)
+	form.Set("grant_type", "client_credentials")
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.tidalAuthURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(c.tidalClientID+":"+c.tidalClientSecret)))
+
+	var payload monochromeTidalTokenResponse
+	if err := c.doJSON(req, &payload); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(payload.AccessToken) == "" {
+		return "", fmt.Errorf("official tidal auth returned empty access token")
+	}
+
+	expirySeconds := payload.ExpiresIn
+	if expirySeconds <= 0 {
+		expirySeconds = 3600
+	}
+	c.token = strings.TrimSpace(payload.AccessToken)
+	c.tokenExpiry = time.Now().Add(time.Duration(expirySeconds-60) * time.Second)
+	return c.token, nil
+}
+
+func (c *monochromeClient) getJSON(ctx context.Context, baseURL, relativePath string, target any) error {
+	requestURL := joinBaseURLAndPath(baseURL, relativePath)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, requestURL, nil)
+	if err != nil {
+		return err
+	}
+
+	return c.doJSON(req, target)
+}
+
+func (c *monochromeClient) doJSON(req *http.Request, target any) error {
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		if len(body) == 0 {
+			return fmt.Errorf("unexpected HTTP %d from %s", resp.StatusCode, req.URL.String())
+		}
+		return fmt.Errorf("unexpected HTTP %d from %s: %s", resp.StatusCode, req.URL.String(), strings.TrimSpace(string(body)))
+	}
+
+	return json.NewDecoder(resp.Body).Decode(target)
+}
+
+func resolvePlaybackInfoURI(payload monochromePlaybackInfo) (string, error) {
+	for _, candidate := range []string{payload.URL, payload.StreamURL, payload.OriginalTrackURL, payload.ManifestURL} {
+		candidate = strings.TrimSpace(candidate)
+		if candidate != "" {
+			return candidate, nil
+		}
+	}
+
+	manifest := strings.TrimSpace(payload.Manifest)
+	if manifest == "" {
+		return "", fmt.Errorf("playback info did not include stream url or manifest")
+	}
+
+	decoded, err := decodePlaybackManifest(manifest)
+	if err != nil {
+		return "", err
+	}
+
+	if strings.Contains(decoded, "<MPD") {
+		return "inline-dash:" + base64.StdEncoding.EncodeToString([]byte(decoded)), nil
+	}
+
+	var manifestPayload struct {
+		URLs []string `json:"urls"`
+	}
+	if json.Unmarshal([]byte(decoded), &manifestPayload) == nil && len(manifestPayload.URLs) > 0 {
+		return strings.TrimSpace(manifestPayload.URLs[0]), nil
+	}
+
+	match := regexp.MustCompile(`https?://[^\s"'<>]+`).FindString(decoded)
+	if match != "" {
+		return match, nil
+	}
+
+	return "", fmt.Errorf("unable to resolve stream URL from playback manifest")
+}
+
+func decodePlaybackManifest(manifest string) (string, error) {
+	if manifest == "" {
+		return "", fmt.Errorf("empty playback manifest")
+	}
+
+	decoded, err := base64.StdEncoding.DecodeString(manifest)
+	if err == nil {
+		return string(decoded), nil
+	}
+
+	return manifest, nil
+}
+
+func bestMonochromeCandidate(candidates []monochromeTrack, meta trackMetadata) (monochromeTrack, int, bool) {
+	bestScore := -1
+	var best monochromeTrack
+
+	for _, candidate := range candidates {
+		score := scoreMonochromeCandidate(candidate, meta)
+		if score > bestScore {
+			bestScore = score
+			best = candidate
+		}
+	}
+
+	if bestScore < 120 {
+		return monochromeTrack{}, 0, false
+	}
+
+	return best, bestScore, true
+}
+
+func scoreMonochromeCandidate(candidate monochromeTrack, meta trackMetadata) int {
+	score := 0
+
+	expectedTitle := normalizeComparableText(meta.Name)
+	candidateTitle := normalizeComparableText(monochromeTrackTitle(candidate))
+	if expectedTitle != "" && candidateTitle == expectedTitle {
+		score += 100
+	} else if expectedTitle != "" && (strings.Contains(candidateTitle, expectedTitle) || strings.Contains(expectedTitle, candidateTitle)) {
+		score += 55
+	}
+
+	expectedArtists := normalizedArtists(meta.Artists)
+	candidateArtists := normalizedArtists(joinArtistNames(candidate.Artists))
+	for _, expected := range expectedArtists {
+		for _, actual := range candidateArtists {
+			if expected == actual {
+				score += 60
+				goto artistDone
+			}
+			if strings.Contains(actual, expected) || strings.Contains(expected, actual) {
+				score += 30
+				goto artistDone
+			}
+		}
+	}
+artistDone:
+
+	expectedAlbum := normalizeComparableText(meta.AlbumName)
+	candidateAlbum := normalizeComparableText(candidate.Album.Title)
+	if expectedAlbum != "" && candidateAlbum == expectedAlbum {
+		score += 20
+	}
+
+	if meta.ISRC != "" && strings.EqualFold(strings.TrimSpace(meta.ISRC), strings.TrimSpace(candidate.ISRC)) {
+		score += 100
+	}
+
+	if candidate.StreamReady {
+		score += 10
+	}
+	if strings.Contains(strings.ToUpper(candidate.AudioQuality), "LOSSLESS") {
+		score += 5
+	}
+
+	if strings.Contains(candidateTitle, "remix") != strings.Contains(expectedTitle, "remix") {
+		score -= 20
+	}
+
+	return score
+}
+
+func monochromeSearchQueries(meta trackMetadata) []string {
+	queries := []string{
+		strings.TrimSpace(meta.Name + " " + firstArtist(meta.Artists)),
+		strings.TrimSpace(meta.Name + " " + meta.Artists),
+	}
+	if meta.ISRC != "" {
+		queries = append([]string{"isrc:" + strings.TrimSpace(meta.ISRC)}, queries...)
+	}
+
+	seen := make(map[string]struct{})
+	filtered := make([]string, 0, len(queries))
+	for _, query := range queries {
+		query = strings.TrimSpace(query)
+		if query == "" {
+			continue
+		}
+		if _, ok := seen[query]; ok {
+			continue
+		}
+		seen[query] = struct{}{}
+		filtered = append(filtered, query)
+	}
+	return filtered
+}
+
+func monochromeTrackTitle(track monochromeTrack) string {
+	title := strings.TrimSpace(track.Title)
+	version := strings.TrimSpace(track.Version)
+	if title == "" {
+		return ""
+	}
+	if version == "" {
+		return title
+	}
+	return title + " " + version
+}
+
+func joinArtistNames(artists []artist) string {
+	names := make([]string, 0, len(artists))
+	for _, artist := range artists {
+		name := strings.TrimSpace(artist.Name)
+		if name != "" {
+			names = append(names, name)
+		}
+	}
+	return strings.Join(names, ", ")
+}
+
+func normalizedArtists(input string) []string {
+	parts := strings.Split(input, ",")
+	normalized := make([]string, 0, len(parts))
+	for _, part := range parts {
+		value := normalizeComparableText(part)
+		if value != "" {
+			normalized = append(normalized, value)
+		}
+	}
+	return normalized
+}
+
+func normalizeComparableText(input string) string {
+	input = strings.ToLower(strings.TrimSpace(input))
+	if input == "" {
+		return ""
+	}
+	input = normalizeTextRegex.ReplaceAllString(input, " ")
+	return strings.Join(strings.Fields(input), " ")
+}
+
+func downloadMonochromeTrack(ctx context.Context, manifestURI, outputPath string, meta trackMetadata) error {
+	ffmpegPath, err := backend.GetFFmpegPath()
+	if err != nil {
+		return fmt.Errorf("failed to resolve ffmpeg path: %w", err)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(outputPath), 0o755); err != nil {
+		return err
+	}
+
+	input := manifestURI
+	if strings.HasPrefix(manifestURI, "inline-dash:") {
+		decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(manifestURI, "inline-dash:"))
+		if err != nil {
+			return fmt.Errorf("failed to decode inline dash manifest: %w", err)
+		}
+
+		manifestPath := filepath.Join(filepath.Dir(outputPath), "manifest.mpd")
+		if err := os.WriteFile(manifestPath, decoded, 0o644); err != nil {
+			return fmt.Errorf("failed to write inline dash manifest: %w", err)
+		}
+		input = manifestPath
+	}
+
+	args := []string{
+		"-y",
+		"-loglevel", "error",
+		"-i", input,
+		"-vn",
+		"-map", "0:a:0",
+		"-c:a", "flac",
+	}
+	args = append(args, ffmpegMetadataArgs(meta)...)
+	args = append(args, outputPath)
+
+	cmd := exec.CommandContext(ctx, ffmpegPath, args...)
+	cmd.Stdout = io.Discard
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		message := strings.TrimSpace(stderr.String())
+		if message == "" {
+			message = err.Error()
+		}
+		return fmt.Errorf("ffmpeg monochrome download failed: %s", message)
+	}
+
+	return nil
+}
+
+func ffmpegMetadataArgs(meta trackMetadata) []string {
+	args := make([]string, 0, 20)
+	appendMeta := func(key, value string) {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return
+		}
+		args = append(args, "-metadata", key+"="+value)
+	}
+
+	appendMeta("title", meta.Name)
+	appendMeta("artist", meta.Artists)
+	appendMeta("album", meta.AlbumName)
+	appendMeta("album_artist", meta.AlbumArtist)
+	appendMeta("date", meta.ReleaseDate)
+	appendMeta("copyright", meta.Copyright)
+	appendMeta("publisher", meta.Publisher)
+	if meta.TrackNumber > 0 {
+		appendMeta("track", fmt.Sprintf("%d/%d", meta.TrackNumber, maxInt(meta.TotalTracks, meta.TrackNumber)))
+	}
+	if meta.DiscNumber > 0 {
+		appendMeta("disc", fmt.Sprintf("%d/%d", meta.DiscNumber, maxInt(meta.TotalDiscs, meta.DiscNumber)))
+	}
+
+	return args
+}
+
+func buildMonochromeFilename(meta trackMetadata) string {
+	base := strings.TrimSpace(meta.Name)
+	artist := strings.TrimSpace(firstArtist(meta.Artists))
+	if base == "" {
+		base = "track"
+	}
+	if artist != "" {
+		base += " - " + artist
+	}
+
+	var cleaned strings.Builder
+	for _, r := range base {
+		switch r {
+		case '<', '>', ':', '"', '/', '\\', '|', '?', '*':
+			cleaned.WriteRune('_')
+		default:
+			if r < 32 {
+				cleaned.WriteRune('_')
+			} else {
+				cleaned.WriteRune(r)
+			}
+		}
+	}
+
+	filename := strings.Join(strings.Fields(cleaned.String()), " ")
+	filename = strings.Trim(filename, ". ")
+	if filename == "" {
+		filename = "track"
+	}
+
+	return filename + ".flac"
+}
+
+func splitCSVEnv(name string, defaults []string) []string {
+	values, _ := splitCSVEnvWithSource(name, defaults)
+	return values
+}
+
+func splitCSVEnvWithSource(name string, defaults []string) ([]string, bool) {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return append([]string(nil), defaults...), false
+	}
+
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			values = append(values, strings.TrimRight(part, "/"))
+		}
+	}
+	if len(values) == 0 {
+		return append([]string(nil), defaults...), false
+	}
+	return values, true
+}
+
+func envStringDefault(name, fallback string) string {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func envDurationDefault(name string, fallback time.Duration) time.Duration {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+
+	parsed, err := time.ParseDuration(value)
+	if err != nil || parsed <= 0 {
+		return fallback
+	}
+
+	return parsed
+}
+
+func mustCompileRegexFromEnv(name, fallback string) *regexp.Regexp {
+	pattern := envStringDefault(name, fallback)
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		panic(fmt.Sprintf("invalid regex in %s: %v", name, err))
+	}
+	return re
+}
+
+func ensureTrailingSlash(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	return strings.TrimRight(value, "/") + "/"
+}
+
+func joinBaseURLAndPath(baseURL, relativePath string) string {
+	baseURL = strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	relativePath = strings.TrimSpace(relativePath)
+	if relativePath == "" {
+		return baseURL
+	}
+	if !strings.HasPrefix(relativePath, "/") {
+		relativePath = "/" + relativePath
+	}
+	return baseURL + relativePath
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func firstArtist(artists string) string {
+	parts := strings.Split(artists, ",")
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(parts[0])
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func normalizeMonochromeInstanceURLs(instances []monochromeInstance) []string {
+	values := make([]string, 0, len(instances))
+	seen := make(map[string]struct{})
+
+	for _, instance := range instances {
+		value := strings.TrimRight(strings.TrimSpace(instance.URL), "/")
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+
+	return values
+}
+
 func fetchTrackMetadata(spotifyURL string) (trackMetadata, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), envDurationDefault("SPOTIFY_METADATA_TIMEOUT", 45*time.Second))
 	defer cancel()
 
 	data, err := backend.GetFilteredSpotifyData(ctx, spotifyURL, false, 0, "", nil)
@@ -557,6 +1503,13 @@ func fetchTrackMetadata(spotifyURL string) (trackMetadata, error) {
 
 	if strings.TrimSpace(payload.Track.Name) == "" {
 		return trackMetadata{}, fmt.Errorf("spotify metadata did not include track name")
+	}
+
+	if payload.Track.ISRC == "" && strings.TrimSpace(payload.Track.SpotifyID) != "" {
+		songLinkClient := backend.NewSongLinkClient()
+		if isrc, isrcErr := songLinkClient.GetISRCDirect(strings.TrimSpace(payload.Track.SpotifyID)); isrcErr == nil {
+			payload.Track.ISRC = strings.TrimSpace(isrc)
+		}
 	}
 
 	return payload.Track, nil

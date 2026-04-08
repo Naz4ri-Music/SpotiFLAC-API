@@ -1,1 +1,5 @@
 spotiflacapi
+.DS_Store
+.gocache/
+.gomodcache/
+.env

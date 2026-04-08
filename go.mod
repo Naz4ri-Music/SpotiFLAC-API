@@ -2,7 +2,7 @@ module spotiflacapi
 
 go 1.26
 
-require github.com/afkarxyz/SpotiFLAC v0.0.0-20260325140645-f13359df7f71
+require github.com/afkarxyz/SpotiFLAC v0.0.0-20260403054616-59a057b14a65
 
 require (
 	github.com/bogem/id3v2/v2 v2.1.4 // indirect
