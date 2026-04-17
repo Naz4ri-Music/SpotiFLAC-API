@@ -63,17 +63,15 @@ var validDownloadEngines = map[string]struct{}{
 }
 
 var defaultMonochromeAPIInstances = []string{
-	"https://hifi.geeked.wtf",
-	"https://eu-central.monochrome.tf",
-	"https://us-west.monochrome.tf",
-	"https://api.monochrome.tf",
 	"https://monochrome-api.samidy.com",
+	"https://api.monochrome.tf",
+	"https://hifi.geeked.wtf",
+	"https://wolf.qqdl.site",
 	"https://maus.qqdl.site",
 	"https://vogel.qqdl.site",
 	"https://katze.qqdl.site",
 	"https://hund.qqdl.site",
 	"https://tidal.kinoplus.online",
-	"https://wolf.qqdl.site",
 }
 
 var defaultMonochromeDiscoveryURLs = []string{
@@ -89,6 +87,8 @@ var defaultMonochromeStreamingInstances = []string{
 	"https://hund.qqdl.site",
 	"https://wolf.qqdl.site",
 }
+
+const defaultMonochromeUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
 type trackMetadata struct {
 	SpotifyID   string `json:"spotify_id"`
@@ -707,6 +707,9 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 			meta.TotalDiscs,
 			meta.Copyright,
 			meta.Publisher,
+			"",
+			"",
+			meta.ISRC,
 			spotifyURL,
 			true,
 			false,
@@ -737,6 +740,8 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 			meta.TotalDiscs,
 			meta.Copyright,
 			meta.Publisher,
+			"",
+			"",
 			spotifyURL,
 			true,
 			false,
@@ -768,6 +773,9 @@ func runServiceDownload(service, spotifyID, spotifyURL string, meta trackMetadat
 			meta.TotalDiscs,
 			meta.Copyright,
 			meta.Publisher,
+			"",
+			"",
+			meta.ISRC,
 			spotifyURL,
 			false,
 			false,
@@ -908,13 +916,13 @@ func (c *monochromeClient) loadDiscoveredInstances(ctx context.Context) {
 
 		discoveredAPI, discoveredStreaming := c.discoverInstances(ctx)
 		if !c.explicitAPIInstances && len(discoveredAPI) > 0 {
-			c.apiInstances = discoveredAPI
+			c.apiInstances = prioritizeMonochromeInstances(mergeUniqueStrings(c.apiInstances, discoveredAPI))
 		}
 		if !c.explicitStreamingInstances {
 			if len(discoveredStreaming) > 0 {
-				c.streamingInstances = discoveredStreaming
+				c.streamingInstances = prioritizeMonochromeInstances(mergeUniqueStrings(c.streamingInstances, discoveredStreaming))
 			} else if len(discoveredAPI) > 0 {
-				c.streamingInstances = append([]string(nil), discoveredAPI...)
+				c.streamingInstances = prioritizeMonochromeInstances(mergeUniqueStrings(c.streamingInstances, discoveredAPI))
 			}
 		}
 	})
@@ -1047,6 +1055,13 @@ func (c *monochromeClient) getJSON(ctx context.Context, baseURL, relativePath st
 }
 
 func (c *monochromeClient) doJSON(req *http.Request, target any) error {
+	if strings.TrimSpace(req.Header.Get("User-Agent")) == "" {
+		req.Header.Set("User-Agent", defaultMonochromeUserAgent)
+	}
+	if strings.TrimSpace(req.Header.Get("Accept")) == "" {
+		req.Header.Set("Accept", "application/json, text/plain, */*")
+	}
+
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -1480,6 +1495,47 @@ func normalizeMonochromeInstanceURLs(instances []monochromeInstance) []string {
 	}
 
 	return values
+}
+
+func mergeUniqueStrings(base []string, extra []string) []string {
+	values := make([]string, 0, len(base)+len(extra))
+	seen := make(map[string]struct{}, len(base)+len(extra))
+
+	appendValue := func(value string) {
+		value = strings.TrimRight(strings.TrimSpace(value), "/")
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		values = append(values, value)
+	}
+
+	for _, value := range base {
+		appendValue(value)
+	}
+	for _, value := range extra {
+		appendValue(value)
+	}
+
+	return values
+}
+
+func prioritizeMonochromeInstances(instances []string) []string {
+	preferred := make([]string, 0, len(instances))
+	deprioritized := make([]string, 0, len(instances))
+
+	for _, instance := range instances {
+		if strings.Contains(instance, ".qqdl.site") {
+			deprioritized = append(deprioritized, instance)
+			continue
+		}
+		preferred = append(preferred, instance)
+	}
+
+	return append(preferred, deprioritized...)
 }
 
 func fetchTrackMetadata(spotifyURL string) (trackMetadata, error) {

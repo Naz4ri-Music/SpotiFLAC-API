@@ -202,8 +202,8 @@ SpotiFLAC now uses `module github.com/afkarxyz/SpotiFLAC`, so this project pins 
 
 Current pin:
 
-- Commit: `59a057b14a65`
-- Pseudo-version: `v0.0.0-20260403054616-59a057b14a65`
+- Commit: `7346730be98c`
+- Pseudo-version: `v0.0.0-20260414003641-7346730be98c`
 
 Update to latest upstream commit:
 
@@ -214,7 +214,7 @@ Update to latest upstream commit:
 Or pin a specific pseudo-version:
 
 ```bash
-./scripts/pin-upstream.sh v0.0.0-20260403054616-59a057b14a65
+./scripts/pin-upstream.sh v0.0.0-20260414003641-7346730be98c
 ```
 
 After changing upstream:
